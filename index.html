@@ -11,13 +11,7 @@
       sizes="180x180"
       href="images/apple-touch-icon-180.png">
 <script>
-  if (
-    location.protocol === 'https:' &&
-    (
-      location.pathname.startsWith('/markdown-editor/') ||
-      location.pathname.startsWith('/publictest/')
-    )
-  ) {
+  if (location.protocol === 'https:' && location.pathname.startsWith('/markdown-editor/')) {
     const manifestLink = document.createElement('link');
     manifestLink.rel = 'manifest';
     manifestLink.href = 'manifest.json';
@@ -4602,7 +4596,8 @@ document.addEventListener('fullscreenchange', handleFullscreenLayoutChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenLayoutChange);
 // Temporary opt-in experiment. No listeners, timers or geometry reads until Start.
 const keyboardDiagnostics = (() => {
-  const BUILD = 'ipad-diag-20261030-1', DURATION = 30000, MAX_LOGS = 2000;
+  const BUILD = 'ipad-diag-20261030-2', DURATION = 30000, MAX_LOGS = 2000;
+  const TARGET_NEWLINES = 7, ACTION_DELAY_MS = 500;
   let run = null;
   const active = () => !!run?.running;
   function note(kind, detail = {}) {
@@ -4636,29 +4631,53 @@ const keyboardDiagnostics = (() => {
     for (const id of run.frames) cancelAnimationFrame(id);
     run.frames.clear();
   }
+  const elapsed = () => Math.round((performance.now() - run.started) * 10) / 10;
+  function fail(status, reason) {
+    if (!active() || run.summary.reason || run.summary.status === 'completed') return;
+    Object.assign(run.summary, { status, reason, failureAtMs:elapsed() });
+    run.valid = false;
+    note(status === 'invalid' ? 'sequence-invalid' :
+      status === 'not-triggered' ? 'experiment-not-triggered' : 'action-aborted', { reason });
+  }
   function interrupt(reason) {
     if (!active()) return;
     run.revision++;
     if (run.pending) {
-      note('action-aborted', { reason }); run.pending = false; clearAction();
+      fail('aborted', reason); run.pending = false; clearAction();
     }
+  }
+  function intervene(reason) {
+    interrupt(reason);
+    if (active() && run.armed && run.count > 0 && !run.fired) fail('invalid', reason);
   }
   function stop(reason = 'manual') {
     if (!active()) return;
-    interrupt(reason); snapshot('recording-stop', { reason });
+    interrupt(reason);
+    if (!run.summary.reason && run.summary.status !== 'completed') {
+      fail('not-triggered', !run.armed ? 'waiting-for-new-document' : 'target-not-reached');
+    }
+    Object.assign(run.summary, { endedAtMs:elapsed(), endReason:reason });
+    snapshot('recording-stop', { reason });
     clearTimeout(run.sampleTimer); clearTimeout(run.endTimer); clearAction();
     for (const remove of run.removeListeners) remove();
     run.removeListeners = []; run.running = false;
   }
+  function arm(cause) {
+    if (!active() || run.fired || run.summary.reason) return;
+    run.armed = true; run.count = 0; run.valid = true;
+    Object.assign(run.summary, { armed:true, armedBy:cause, armedAtMs:elapsed(), status:'armed' });
+    snapshot('experiment-armed', { cause, targetNewlines:TARGET_NEWLINES });
+  }
   function newDocument() {
     if (!active()) return;
-    interrupt('new-document');
-    if (run.fired) { note('new-document-after-trial'); return; }
-    run.armed = true; run.count = 0; run.valid = true;
-    snapshot('new-document-armed');
+    intervene('new-document');
+    if (editor.value !== '') { note('new-document-not-empty'); return; }
+    arm('new-file');
+    if (run.valid && !run.fired) snapshot('new-document-armed');
   }
   function eligible() {
-    return editor.value === '\n'.repeat(5) && editor.selectionStart === 5 && editor.selectionEnd === 5 &&
+    return editor.value === '\n'.repeat(TARGET_NEWLINES) &&
+      editor.selectionStart === TARGET_NEWLINES && editor.selectionEnd === TARGET_NEWLINES &&
       document.activeElement === editor && !isEditorComposing && !document.hidden;
   }
   function onInput(e) {
@@ -4666,29 +4685,39 @@ const keyboardDiagnostics = (() => {
     snapshot('input', { inputType:e.inputType || '', eventComposing:!!e.isComposing });
     if (!run.armed || run.fired || !run.valid) return;
     const next = run.count + 1;
-    if (e.isComposing || isEditorComposing || next > 5 ||
+    if (e.isComposing || isEditorComposing || next > TARGET_NEWLINES ||
         !['insertLineBreak','insertParagraph','insertText'].includes(e.inputType) ||
         editor.value !== '\n'.repeat(next) || editor.selectionStart !== next || editor.selectionEnd !== next) {
-      run.valid = false; note('sequence-invalid'); return;
+      fail('invalid', e.isComposing || isEditorComposing ? 'composition-input' : 'unexpected-input-or-selection'); return;
     }
     run.count = next;
-    if (next !== 5) return;
+    run.summary.enteredNewlines = next;
+    run.summary.status = 'collecting';
+    if (next !== TARGET_NEWLINES) return;
     run.fired = true; run.pending = true;
     const current = run, revision = run.revision;
-    snapshot('fifth-newline', { delayMs:500 });
+    Object.assign(run.summary, { targetDetected:true, targetAtMs:elapsed(), status:'pending' });
+    snapshot('target-newline', { targetNewlines:TARGET_NEWLINES, delayMs:ACTION_DELAY_MS });
     run.actionTimer = setTimeout(() => {
       run.actionTimer = null;
       if (performance.now() - current.started >= DURATION) { stop('deadline'); return; }
       if (run !== current || !active() || revision !== run.revision || !eligible()) {
         interrupt('conditions-changed'); return;
       }
-      if (run.mode === 'A') { snapshot('A-marker'); run.pending = false; return; }
+      Object.assign(run.summary, { executed:true, executedAtMs:elapsed() });
+      if (run.mode === 'A') {
+        Object.assign(run.summary, { markerRecorded:true, status:'completed', completedAtMs:elapsed() });
+        snapshot('A-marker'); run.pending = false; return;
+      }
+      run.summary.status = 'executing';
       const original = editor.scrollTop, max = Math.max(0, editor.scrollHeight - editor.clientHeight);
       const target = original < max ? Math.min(max, original + 1) : Math.max(0, original - 1);
       snapshot('B-before', { original, target, max });
       editor.scrollTop = target;
       const moved = editor.scrollTop;
-      snapshot('B-moved', { original, target, actual:moved, moved:Math.abs(moved-original) > 0.01 });
+      Object.assign(run.summary, { moved:Math.abs(moved-original) > 0.01, movedAtMs:elapsed(),
+        originalScrollTop:original, targetScrollTop:target, movedScrollTop:moved });
+      snapshot('B-moved', { original, target, actual:moved, moved:run.summary.moved });
       // Native scroll listeners keep the backdrop synchronized. Do not dispatch fake events.
       const frame = fn => {
         const id = requestAnimationFrame(() => { current.frames.delete(id); fn(); });
@@ -4701,19 +4730,27 @@ const keyboardDiagnostics = (() => {
           interrupt('restore-conditions-changed'); return;
         }
         editor.scrollTop = original;
+        Object.assign(run.summary, { restored:Math.abs(editor.scrollTop-original) <= 0.1,
+          restoredAtMs:elapsed(), restoredScrollTop:editor.scrollTop });
+        if (run.summary.restored) Object.assign(run.summary, { status:'completed', completedAtMs:elapsed() });
+        else fail('aborted', 'restore-not-achieved');
         snapshot('B-restored', { original, actual:editor.scrollTop });
         run.pending = false;
       }));
-    }, 500);
+    }, ACTION_DELAY_MS);
   }
   function start(mode) {
     if (!['A','B'].includes(mode)) throw new Error('Unknown diagnostic mode');
     stop('restart');
     run = { mode, running:true, started:performance.now(), logs:[], dropped:0, frames:new Set(),
       removeListeners:[], revision:0, armed:false, fired:false, pending:false, valid:false, count:0,
+      summary:{ build:BUILD, mode, targetNewlines:TARGET_NEWLINES, status:'waiting-document',
+        armed:false, armedBy:null, armedAtMs:null, enteredNewlines:0, targetDetected:false, targetAtMs:null,
+        executed:false, executedAtMs:null, markerRecorded:false, moved:null, movedAtMs:null,
+        restored:null, restoredAtMs:null, completedAtMs:null, reason:null, failureAtMs:null, endedAtMs:null, endReason:null },
       environment:{ build:BUILD, mode, standaloneMedia:window.matchMedia('(display-mode: standalone)').matches,
         navigatorStandalone:navigator.standalone === true, userAgent:navigator.userAgent,
-        durationMs:DURATION, sampleIntervalMs:100, maxLogs:MAX_LOGS, actionDelayMs:500 } };
+        durationMs:DURATION, sampleIntervalMs:100, maxLogs:MAX_LOGS, actionDelayMs:ACTION_DELAY_MS, targetNewlines:TARGET_NEWLINES } };
     const listen = (target, name, fn, capture = false) => {
       if (!target) return;
       const options = { passive:true, capture };
@@ -4722,31 +4759,35 @@ const keyboardDiagnostics = (() => {
     };
     listen(editor, 'input', onInput);
     for (const name of ['compositionstart','compositionend']) listen(editor, name, () => {
-      interrupt(name); if (run.armed && !run.fired) run.valid = false; snapshot(name);
+      interrupt(name); if (run.armed && !run.fired) fail('invalid', name); snapshot(name);
     });
     listen(document, 'selectionchange', () => {
       if (run.pending && !eligible()) interrupt('selection-changed');
+      else if (run.armed && run.count > 0 && !run.fired &&
+        (document.activeElement !== editor || editor.selectionStart !== run.count || editor.selectionEnd !== run.count))
+        fail('invalid', 'selection-changed');
     });
     for (const name of ['touchstart','touchend','touchcancel','pointerdown','pointerup','wheel']) {
       listen(document, name, () => {
-        interrupt(name); if (run.armed && run.count > 0 && !run.fired) run.valid = false; snapshot(name);
+        intervene(name); snapshot(name);
       }, true);
     }
     listen(document, 'keydown', e => {
       if (e.key !== 'Enter' || run.fired) {
-        interrupt('keydown'); if (run.armed && !run.fired) run.valid = false;
+        intervene('keydown');
       }
     }, true);
     listen(editor, 'scroll', () => snapshot('editor-scroll'));
     listen(window, 'scroll', () => snapshot('page-scroll'));
     for (const name of ['resize','scroll']) listen(window.visualViewport, name, () => snapshot('viewport-' + name));
-    for (const name of ['focus','blur']) listen(window, name, () => { interrupt('window-' + name); snapshot('window-' + name); });
-    for (const name of ['focusin','focusout']) listen(document, name, () => { interrupt(name); snapshot(name); });
+    for (const name of ['focus','blur']) listen(window, name, () => { intervene('window-' + name); snapshot('window-' + name); });
+    for (const name of ['focusin','focusout']) listen(document, name, () => { intervene(name); snapshot(name); });
     listen(document, 'visibilitychange', () => {
       interrupt('visibilitychange'); snapshot('visibilitychange'); if (document.hidden) stop('hidden');
     });
     listen(window, 'pagehide', () => stop('pagehide'));
     snapshot('recording-start');
+    if (editor.value === '') arm('empty-at-start');
     const current = run;
     const sample = () => {
       if (run !== current || !active()) return;
@@ -4758,9 +4799,10 @@ const keyboardDiagnostics = (() => {
   }
   function result() {
     return { build:BUILD, mode:run?.mode || null, running:active(), environment:run?.environment || null,
+      summary:run ? { ...run.summary } : null,
       dropped:run?.dropped || 0, logs:run?.logs.slice() || [] };
   }
-  return { build:BUILD, start, stop, newDocument, note, snapshot, result, active };
+  return { build:BUILD, targetNewlines:TARGET_NEWLINES, start, stop, newDocument, note, snapshot, result, active };
 })();
 
 function showKeyboardDiagnostics() {
@@ -4776,8 +4818,8 @@ function showKeyboardDiagnostics() {
       #keyboard-diagnostics-panel button{min-height:44px;padding:10px 14px;margin:4px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);font:inherit;cursor:pointer}
     </style><div style="background:var(--surface);color:var(--text);padding:24px;max-width:560px;max-height:90%;overflow:auto;border:1px solid var(--border)">
       <p>iPadキーボード診断 <span id="keyboard-diagnostics-status"></span></p>
-      <p>キーボードを閉じて開始してください。開始後30秒以内に「ファイル → 新規」を実行し、Enterを5回。1秒待って右下ボタンで閉じ、表示を観察してください。</p>
-      <p>Bだけが5回目の入力の500ms後に本文を1px往復します。実験中の表示・通知はありません。</p>
+      <p>キーボードを閉じて開始してください。空文書なら開始後そのまま本文へ移れます。本文が空でなければ、開始後に「ファイル → 新規」を実行してください。30秒以内にEnterを${keyboardDiagnostics.targetNewlines}回（${keyboardDiagnostics.targetNewlines + 1}行目）。最後の入力から1秒待って右下ボタンで閉じ、表示を観察してください。</p>
+      <p>Bだけが${keyboardDiagnostics.targetNewlines}回目の入力の500ms後に本文を1px往復します。実験中の表示・通知はありません。</p>
       <button type="button" data-diag="A">A：記録を開始</button>
       <button type="button" data-diag="B">B：往復実験を開始</button>
       <button type="button" data-diag="export">終了してJSON取得</button>
@@ -4800,7 +4842,7 @@ function showKeyboardDiagnostics() {
   }
   const result = keyboardDiagnostics.result();
   document.getElementById('keyboard-diagnostics-status').textContent =
-    `${result.build} / ${result.mode || '未選択'} / ${result.running ? '記録中' : '停止中'}`;
+    `${result.build} / ${result.mode || '未選択'} / ${result.running ? '記録中' : '停止中'} / ${result.summary?.status || '未開始'} / 開始時：${editor.value === '' ? '空文書・待ち受け可能' : '新規作成が必要'}`;
   // Opening the panel happens only after observation; mark it as contaminated.
   keyboardDiagnostics.note('diagnostic-panel-opened');
 }
