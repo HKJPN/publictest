@@ -1844,7 +1844,6 @@ body.zen-mode #zen-exit-btn { display: flex; }
       <div class="menu-entry" onclick="showAboutMdworks()">
         <span id="m-help-about"></span>
       </div>
-      <div class="menu-entry" onclick="showKeyboardDiagnostics()">iPadキーボード診断（実験用）</div>
     </div>
   </div>
   <button
@@ -4594,211 +4593,6 @@ document.querySelectorAll('.menu-trigger').forEach(btn => {
 document.addEventListener('click', closeMenus);
 document.addEventListener('fullscreenchange', handleFullscreenLayoutChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenLayoutChange);
-// Temporary opt-in experiment. No listeners, timers or geometry reads until Start.
-const keyboardDiagnostics = (() => {
-  const BUILD = 'ipad-diag-20261030-1', DURATION = 30000, MAX_LOGS = 2000;
-  let run = null;
-  const active = () => !!run?.running;
-  function note(kind, detail = {}) {
-    if (!active()) return;
-    const entry = { ms: Math.round((performance.now() - run.started) * 10) / 10, kind, ...detail };
-    if (run.logs.length >= MAX_LOGS) { run.logs.shift(); run.dropped++; }
-    run.logs.push(entry);
-  }
-  function snapshot(kind, detail = {}) {
-    if (!active()) return;
-    const box = el => {
-      const r = el.getBoundingClientRect();
-      return { top:r.top, left:r.left, width:r.width, height:r.height,
-        scrollTop:el.scrollTop, scrollLeft:el.scrollLeft, scrollHeight:el.scrollHeight, clientHeight:el.clientHeight };
-    };
-    const v = window.visualViewport, a = document.activeElement;
-    note(kind, { ...detail, textLength:editor.value.length, lines:editor.value.split('\n').length,
-      selection:[editor.selectionStart, editor.selectionEnd, editor.selectionDirection], composing:isEditorComposing,
-      editor:box(editor), backdrop:box(backdrop), body:box(document.body), root:box(document.documentElement),
-      scrollingElement:document.scrollingElement ? { top:document.scrollingElement.scrollTop, height:document.scrollingElement.scrollHeight } : null,
-      viewport:v ? { height:v.height, width:v.width, offsetTop:v.offsetTop, pageTop:v.pageTop, scale:v.scale } : null,
-      innerHeight:window.innerHeight, scrollY:window.scrollY,
-      appliedHeight:document.body.style.getPropertyValue('--app-viewport-height'),
-      appliedTop:document.body.style.getPropertyValue('--app-viewport-top'),
-      visibility:document.visibilityState, hasFocus:document.hasFocus(),
-      activeElement:a ? { tag:a.tagName, id:a.id } : null });
-  }
-  function clearAction() {
-    if (!run) return;
-    clearTimeout(run.actionTimer); run.actionTimer = null;
-    for (const id of run.frames) cancelAnimationFrame(id);
-    run.frames.clear();
-  }
-  function interrupt(reason) {
-    if (!active()) return;
-    run.revision++;
-    if (run.pending) {
-      note('action-aborted', { reason }); run.pending = false; clearAction();
-    }
-  }
-  function stop(reason = 'manual') {
-    if (!active()) return;
-    interrupt(reason); snapshot('recording-stop', { reason });
-    clearTimeout(run.sampleTimer); clearTimeout(run.endTimer); clearAction();
-    for (const remove of run.removeListeners) remove();
-    run.removeListeners = []; run.running = false;
-  }
-  function newDocument() {
-    if (!active()) return;
-    interrupt('new-document');
-    if (run.fired) { note('new-document-after-trial'); return; }
-    run.armed = true; run.count = 0; run.valid = true;
-    snapshot('new-document-armed');
-  }
-  function eligible() {
-    return editor.value === '\n'.repeat(5) && editor.selectionStart === 5 && editor.selectionEnd === 5 &&
-      document.activeElement === editor && !isEditorComposing && !document.hidden;
-  }
-  function onInput(e) {
-    interrupt('input');
-    snapshot('input', { inputType:e.inputType || '', eventComposing:!!e.isComposing });
-    if (!run.armed || run.fired || !run.valid) return;
-    const next = run.count + 1;
-    if (e.isComposing || isEditorComposing || next > 5 ||
-        !['insertLineBreak','insertParagraph','insertText'].includes(e.inputType) ||
-        editor.value !== '\n'.repeat(next) || editor.selectionStart !== next || editor.selectionEnd !== next) {
-      run.valid = false; note('sequence-invalid'); return;
-    }
-    run.count = next;
-    if (next !== 5) return;
-    run.fired = true; run.pending = true;
-    const current = run, revision = run.revision;
-    snapshot('fifth-newline', { delayMs:500 });
-    run.actionTimer = setTimeout(() => {
-      run.actionTimer = null;
-      if (performance.now() - current.started >= DURATION) { stop('deadline'); return; }
-      if (run !== current || !active() || revision !== run.revision || !eligible()) {
-        interrupt('conditions-changed'); return;
-      }
-      if (run.mode === 'A') { snapshot('A-marker'); run.pending = false; return; }
-      const original = editor.scrollTop, max = Math.max(0, editor.scrollHeight - editor.clientHeight);
-      const target = original < max ? Math.min(max, original + 1) : Math.max(0, original - 1);
-      snapshot('B-before', { original, target, max });
-      editor.scrollTop = target;
-      const moved = editor.scrollTop;
-      snapshot('B-moved', { original, target, actual:moved, moved:Math.abs(moved-original) > 0.01 });
-      // Native scroll listeners keep the backdrop synchronized. Do not dispatch fake events.
-      const frame = fn => {
-        const id = requestAnimationFrame(() => { current.frames.delete(id); fn(); });
-        current.frames.add(id);
-      };
-      frame(() => frame(() => {
-        if (run !== current || !active()) return;
-        if (performance.now() - run.started >= DURATION) { stop('deadline'); return; }
-        if (revision !== run.revision || !eligible() || Math.abs(editor.scrollTop - moved) > 0.1) {
-          interrupt('restore-conditions-changed'); return;
-        }
-        editor.scrollTop = original;
-        snapshot('B-restored', { original, actual:editor.scrollTop });
-        run.pending = false;
-      }));
-    }, 500);
-  }
-  function start(mode) {
-    if (!['A','B'].includes(mode)) throw new Error('Unknown diagnostic mode');
-    stop('restart');
-    run = { mode, running:true, started:performance.now(), logs:[], dropped:0, frames:new Set(),
-      removeListeners:[], revision:0, armed:false, fired:false, pending:false, valid:false, count:0,
-      environment:{ build:BUILD, mode, standaloneMedia:window.matchMedia('(display-mode: standalone)').matches,
-        navigatorStandalone:navigator.standalone === true, userAgent:navigator.userAgent,
-        durationMs:DURATION, sampleIntervalMs:100, maxLogs:MAX_LOGS, actionDelayMs:500 } };
-    const listen = (target, name, fn, capture = false) => {
-      if (!target) return;
-      const options = { passive:true, capture };
-      target.addEventListener(name, fn, options);
-      run.removeListeners.push(() => target.removeEventListener(name, fn, options));
-    };
-    listen(editor, 'input', onInput);
-    for (const name of ['compositionstart','compositionend']) listen(editor, name, () => {
-      interrupt(name); if (run.armed && !run.fired) run.valid = false; snapshot(name);
-    });
-    listen(document, 'selectionchange', () => {
-      if (run.pending && !eligible()) interrupt('selection-changed');
-    });
-    for (const name of ['touchstart','touchend','touchcancel','pointerdown','pointerup','wheel']) {
-      listen(document, name, () => {
-        interrupt(name); if (run.armed && run.count > 0 && !run.fired) run.valid = false; snapshot(name);
-      }, true);
-    }
-    listen(document, 'keydown', e => {
-      if (e.key !== 'Enter' || run.fired) {
-        interrupt('keydown'); if (run.armed && !run.fired) run.valid = false;
-      }
-    }, true);
-    listen(editor, 'scroll', () => snapshot('editor-scroll'));
-    listen(window, 'scroll', () => snapshot('page-scroll'));
-    for (const name of ['resize','scroll']) listen(window.visualViewport, name, () => snapshot('viewport-' + name));
-    for (const name of ['focus','blur']) listen(window, name, () => { interrupt('window-' + name); snapshot('window-' + name); });
-    for (const name of ['focusin','focusout']) listen(document, name, () => { interrupt(name); snapshot(name); });
-    listen(document, 'visibilitychange', () => {
-      interrupt('visibilitychange'); snapshot('visibilitychange'); if (document.hidden) stop('hidden');
-    });
-    listen(window, 'pagehide', () => stop('pagehide'));
-    snapshot('recording-start');
-    const current = run;
-    const sample = () => {
-      if (run !== current || !active()) return;
-      if (performance.now() - run.started >= DURATION) { stop('deadline'); return; }
-      snapshot('sample'); run.sampleTimer = setTimeout(sample, 100);
-    };
-    run.sampleTimer = setTimeout(sample, 100);
-    run.endTimer = setTimeout(() => stop('deadline'), DURATION);
-  }
-  function result() {
-    return { build:BUILD, mode:run?.mode || null, running:active(), environment:run?.environment || null,
-      dropped:run?.dropped || 0, logs:run?.logs.slice() || [] };
-  }
-  return { build:BUILD, start, stop, newDocument, note, snapshot, result, active };
-})();
-
-function showKeyboardDiagnostics() {
-  closeMenus();
-  let panel = document.getElementById('keyboard-diagnostics-panel');
-  if (!panel) {
-    panel = document.createElement('div'); panel.id = 'keyboard-diagnostics-panel';
-    panel.setAttribute('role','dialog'); panel.setAttribute('aria-modal','true');
-    panel.setAttribute('aria-label','iPadキーボード診断');
-    panel.style.cssText = 'position:fixed;inset:0;z-index:30000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center';
-    panel.innerHTML = `<style>
-      #keyboard-diagnostics-panel p{margin-bottom:12px;line-height:1.6}
-      #keyboard-diagnostics-panel button{min-height:44px;padding:10px 14px;margin:4px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);font:inherit;cursor:pointer}
-    </style><div style="background:var(--surface);color:var(--text);padding:24px;max-width:560px;max-height:90%;overflow:auto;border:1px solid var(--border)">
-      <p>iPadキーボード診断 <span id="keyboard-diagnostics-status"></span></p>
-      <p>キーボードを閉じて開始してください。開始後30秒以内に「ファイル → 新規」を実行し、Enterを5回。1秒待って右下ボタンで閉じ、表示を観察してください。</p>
-      <p>Bだけが5回目の入力の500ms後に本文を1px往復します。実験中の表示・通知はありません。</p>
-      <button type="button" data-diag="A">A：記録を開始</button>
-      <button type="button" data-diag="B">B：往復実験を開始</button>
-      <button type="button" data-diag="export">終了してJSON取得</button>
-      <button type="button" data-diag="stop">診断を停止</button>
-      <button type="button" data-diag="close">閉じる</button>
-      <p>ログはメモリのみ。本文・ファイル名は記録しません。再読み込みで消えます。計測自体が結果に影響する可能性があります。</p>
-    </div>`;
-    panel.addEventListener('click', e => {
-      const action = e.target.dataset.diag;
-      if (!action) return;
-      if (action === 'A' || action === 'B') { panel.remove(); keyboardDiagnostics.start(action); return; }
-      if (action === 'export') {
-        keyboardDiagnostics.stop('export');
-        triggerDownload(JSON.stringify(keyboardDiagnostics.result(), null, 2), 'mdworks-ipad-diagnostic.json', 'application/json');
-      }
-      if (action === 'stop') keyboardDiagnostics.stop('disabled');
-      panel.remove();
-    });
-    document.body.appendChild(panel);
-  }
-  const result = keyboardDiagnostics.result();
-  document.getElementById('keyboard-diagnostics-status').textContent =
-    `${result.build} / ${result.mode || '未選択'} / ${result.running ? '記録中' : '停止中'}`;
-  // Opening the panel happens only after observation; mark it as contaminated.
-  keyboardDiagnostics.note('diagnostic-panel-opened');
-}
-
 let viewportRefreshTimer = null;
 let viewportRefreshRaf = null;
 let layoutObserver = null;
@@ -4856,22 +4650,20 @@ function keepEditorCaretVisibleAfterResize() {
   }
 }
 
-function updateVisualViewportLayout(source = 'direct') {
-  const diagnostic = (reason) => keyboardDiagnostics.note('layout-update', { source, reason });
+function updateVisualViewportLayout() {
   const viewport = window.visualViewport;
-  if (!viewport) { diagnostic('no-api'); return; }
+  if (!viewport) return;
   // Freeze the last unzoomed app box during pinch zoom. Resizing/repositioning
   // it to the magnified viewport would reflow text and fight normal panning.
-  if (!Number.isFinite(viewport.scale) || Math.abs(viewport.scale - 1) > 0.01) { diagnostic('zoom'); return; }
+  if (!Number.isFinite(viewport.scale) || Math.abs(viewport.scale - 1) > 0.01) return;
   const height = viewport.height;
   const top = Math.max(0, viewport.offsetTop);
   const width = viewport.width;
-  if (![height, top, width].every(Number.isFinite) || height <= 0 || width <= 0) { diagnostic('invalid-bounds'); return; }
+  if (![height, top, width].every(Number.isFinite) || height <= 0 || width <= 0) return;
   const previous = lastVisualViewportBounds;
   const sizeChanged = !previous || Math.abs(height - previous.height) >= 0.5 || Math.abs(width - previous.width) >= 0.5;
   const topChanged = !previous || Math.abs(top - previous.top) >= 0.5;
-  if (!sizeChanged && !topChanged) { diagnostic('unchanged'); return; }
-  diagnostic(sizeChanged ? 'size-changed' : 'top-changed');
+  if (!sizeChanged && !topChanged) return;
 
   const previousEditorHeight = editor.clientHeight;
   document.body.style.setProperty('--app-viewport-height', `${height}px`);
@@ -4900,7 +4692,7 @@ function scheduleVisualViewportLayout() {
   if (visualViewportRaf !== null) return;
   visualViewportRaf = requestAnimationFrame(() => {
     visualViewportRaf = null;
-    updateVisualViewportLayout('raf');
+    updateVisualViewportLayout();
   });
 }
 
@@ -4933,7 +4725,7 @@ function handleVisualViewportChange() {
     }
     // This applies the same scale guard, change detection and scroll sync as
     // the immediate path. It does not start or extend a resampling cycle.
-    updateVisualViewportLayout('resample');
+    updateVisualViewportLayout();
     cycle.index++;
     // Skip missed slots instead of issuing a burst of catch-up reads if the
     // main thread was busy. A suspended page never replays an old cycle.
@@ -5142,7 +4934,6 @@ function normalizePreviewWidth(reason = '') {
 }
 
 function refreshLayoutAfterViewportChange(reason = '') {
-  keyboardDiagnostics.note('layout-refresh', { reason });
   syncIPadSafariFullscreenClass();
   renderFullscreenMenuCheck();
   if (previewOpen) {
@@ -5156,7 +4947,6 @@ function refreshLayoutAfterViewportChange(reason = '') {
 }
 
 function scheduleViewportRefresh(reason = '') {
-  keyboardDiagnostics.note('layout-refresh-scheduled', { reason });
   if (viewportRefreshRaf !== null) cancelAnimationFrame(viewportRefreshRaf);
   viewportRefreshRaf = requestAnimationFrame(() => {
     viewportRefreshRaf = null;
@@ -11855,7 +11645,6 @@ async function newFile() {
   resetDocumentIdentity();
   update();
   markSaved();
-  keyboardDiagnostics.newDocument();
   await triggerAutoSave();
   editor.focus();
   const continuedSessionId = resumeDeepEditForFreshDocumentContext(continueDeepEdit, 'new-file');
