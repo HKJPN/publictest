@@ -4602,7 +4602,7 @@ document.addEventListener('fullscreenchange', handleFullscreenLayoutChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenLayoutChange);
 // Temporary opt-in experiment. No listeners, timers or geometry reads until Start.
 const keyboardDiagnostics = (() => {
-  const BUILD = 'ipad-diag-20261030-2', DURATION = 30000, MAX_LOGS = 2000;
+  const BUILD = 'ipad-diag-20261030-3', DURATION = 30000, MAX_LOGS = 2000;
   const TARGET_NEWLINES = 7, ACTION_DELAY_MS = 500;
   let run = null;
   const active = () => !!run?.running;
@@ -4686,6 +4686,31 @@ const keyboardDiagnostics = (() => {
       editor.selectionStart === TARGET_NEWLINES && editor.selectionEnd === TARGET_NEWLINES &&
       document.activeElement === editor && !isEditorComposing && !document.hidden;
   }
+  function moveTowardStartOnce() {
+    const original = editor.scrollTop;
+    const max = Math.max(0, editor.scrollHeight - editor.clientHeight);
+    let movementReason = null;
+    if (!Number.isFinite(original) || !Number.isFinite(max)) movementReason = 'invalid-scroll-bounds';
+    else if (max <= 0) movementReason = 'no-scroll-range';
+    else if (original < 0 || original > max) movementReason = 'outside-normal-scroll-range';
+    else if (original === 0) movementReason = 'at-start';
+    const target = movementReason ? null : Math.max(0, original - 1);
+    snapshot('C-before', { original, target, max, restoreExpected:false });
+    // One assignment only. Never normalize overscroll, restore or enforce position.
+    if (!movementReason) editor.scrollTop = target;
+    const actual = editor.scrollTop;
+    const delta = actual - original;
+    const moved = Number.isFinite(delta) && delta !== 0;
+    if (!movementReason && !moved) movementReason = 'no-actual-movement';
+    else if (!movementReason && (!Number.isFinite(actual) || actual < 0 || actual >= original))
+      movementReason = 'unexpected-scroll-result';
+    Object.assign(run.summary, { originalScrollTop:original, targetScrollTop:target,
+      movedScrollTop:actual, actualDelta:delta, moved, movedAtMs:elapsed(), movementReason,
+      assignmentMade:target !== null, status:'completed', completedAtMs:elapsed() });
+    snapshot('C-moved', { original, target, actual, actualDelta:delta, moved, reason:movementReason,
+      assignmentMade:target !== null, restoreExpected:false });
+    run.pending = false;
+  }
   function onInput(e) {
     interrupt('input');
     snapshot('input', { inputType:e.inputType || '', eventComposing:!!e.isComposing });
@@ -4716,6 +4741,7 @@ const keyboardDiagnostics = (() => {
         snapshot('A-marker'); run.pending = false; return;
       }
       run.summary.status = 'executing';
+      if (run.mode === 'C') { moveTowardStartOnce(); return; }
       const original = editor.scrollTop, max = Math.max(0, editor.scrollHeight - editor.clientHeight);
       const target = original < max ? Math.min(max, original + 1) : Math.max(0, original - 1);
       snapshot('B-before', { original, target, max });
@@ -4746,11 +4772,12 @@ const keyboardDiagnostics = (() => {
     }, ACTION_DELAY_MS);
   }
   function start(mode) {
-    if (!['A','B'].includes(mode)) throw new Error('Unknown diagnostic mode');
+    if (!['A','B','C'].includes(mode)) throw new Error('Unknown diagnostic mode');
     stop('restart');
     run = { mode, running:true, started:performance.now(), logs:[], dropped:0, frames:new Set(),
       removeListeners:[], revision:0, armed:false, fired:false, pending:false, valid:false, count:0,
       summary:{ build:BUILD, mode, targetNewlines:TARGET_NEWLINES, status:'waiting-document',
+        restoreExpected:mode === 'B', movementReason:null,
         armed:false, armedBy:null, armedAtMs:null, enteredNewlines:0, targetDetected:false, targetAtMs:null,
         executed:false, executedAtMs:null, markerRecorded:false, moved:null, movedAtMs:null,
         restored:null, restoredAtMs:null, completedAtMs:null, reason:null, failureAtMs:null, endedAtMs:null, endReason:null },
@@ -4824,10 +4851,11 @@ function showKeyboardDiagnostics() {
       #keyboard-diagnostics-panel button{min-height:44px;padding:10px 14px;margin:4px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);font:inherit;cursor:pointer}
     </style><div style="background:var(--surface);color:var(--text);padding:24px;max-width:560px;max-height:90%;overflow:auto;border:1px solid var(--border)">
       <p>iPadキーボード診断 <span id="keyboard-diagnostics-status"></span></p>
-      <p>キーボードを閉じて開始してください。空文書なら開始後そのまま本文へ移れます。本文が空でなければ、開始後に「ファイル → 新規」を実行してください。30秒以内にEnterを${keyboardDiagnostics.targetNewlines}回（${keyboardDiagnostics.targetNewlines + 1}行目）。最後の入力から1秒待って右下ボタンで閉じ、表示を観察してください。</p>
-      <p>Bだけが${keyboardDiagnostics.targetNewlines}回目の入力の500ms後に本文を1px往復します。実験中の表示・通知はありません。</p>
+      <p>キーボードを閉じて開始してください。空文書なら開始後そのまま本文へ移れます。本文が空でなければ、開始後に「ファイル → 新規」を実行してください。30秒以内にEnterを${keyboardDiagnostics.targetNewlines}回（${keyboardDiagnostics.targetNewlines + 1}行目）。最後の入力から1秒待って右下ボタンで閉じ、閉じた直後と約1秒後の表示を観察し、観察が終わるまで画面に追加で触れないでください。</p>
+      <p>Bは${keyboardDiagnostics.targetNewlines}回目の入力の500ms後に本文を1px往復。Cは同じタイミングで行頭側へ1px移動し、元へ戻しません。位置の強制固定はしません。実験中の表示・通知はありません。</p>
       <button type="button" data-diag="A">A：記録を開始</button>
       <button type="button" data-diag="B">B：往復実験を開始</button>
+      <button type="button" data-diag="C">C：行頭側へ1px移動して保持</button>
       <button type="button" data-diag="export">終了してJSON取得</button>
       <button type="button" data-diag="stop">診断を停止</button>
       <button type="button" data-diag="close">閉じる</button>
@@ -4836,7 +4864,7 @@ function showKeyboardDiagnostics() {
     panel.addEventListener('click', e => {
       const action = e.target.dataset.diag;
       if (!action) return;
-      if (action === 'A' || action === 'B') { panel.remove(); keyboardDiagnostics.start(action); return; }
+      if (['A','B','C'].includes(action)) { panel.remove(); keyboardDiagnostics.start(action); return; }
       if (action === 'export') {
         keyboardDiagnostics.stop('export');
         triggerDownload(JSON.stringify(keyboardDiagnostics.result(), null, 2), 'mdworks-ipad-diagnostic.json', 'application/json');
