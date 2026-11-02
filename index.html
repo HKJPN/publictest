@@ -4603,7 +4603,8 @@ document.addEventListener('fullscreenchange', handleFullscreenLayoutChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenLayoutChange);
 // Opt-in, bounded recording. All geometry reads are behind active().
 const ipadKeyboardRecording = (() => {
-  const build = 'ipad-keyboard-recording-20261102-1';
+  const build = 'ipad-keyboard-recording-20261102-2';
+  const extraDistance = 57, extraDelayMs = 1500;
   const durationMs = 30000, maxEntries = 1500;
   let recording = null;
   const active = () => !!recording?.running;
@@ -4642,8 +4643,67 @@ const ipadKeyboardRecording = (() => {
       visibility:document.visibilityState, hasFocus:document.hasFocus(),
       activeElement:a ? { tag:a.tagName, id:a.id } : null });
   }
+  function cancelExtra(reason) {
+    if (!active() || !recording.extraPrivate) return;
+    clearTimeout(recording.extraTimer);
+    recording.extraTimer = null;
+    recording.extraPrivate = null;
+    Object.assign(recording.experiment, { status:'cancelled', reason, cancelledAtMs:time() });
+    event('extra-cancelled', { reason });
+  }
+  function geometry() {
+    const v = window.visualViewport;
+    return v ? { height:v.height, width:v.width, scale:v.scale,
+      rootHeight:document.documentElement.clientHeight, rootWidth:document.documentElement.clientWidth } : null;
+  }
+  function onCorrection(sessionId, original, actual) {
+    if (!active() || recording.mode !== 'extra' || recording.experiment.originDetected || recording.experiment.reason) return;
+    if (!(actual < original && actual >= 0)) return;
+    const summary = recording.experiment;
+    Object.assign(summary, { originDetected:true, originAtMs:time(), originBefore:original, originAfter:actual,
+      sessionId, scheduled:true, scheduledAtMs:time(), status:'pending' });
+    const pending = { sessionId, top:actual, value:editor.value, start:editor.selectionStart,
+      end:editor.selectionEnd, direction:editor.selectionDirection, geometry:geometry() };
+    recording.extraPrivate = pending;
+    event('extra-scheduled', { sessionId, original, actual, delayMs:extraDelayMs, distance:extraDistance });
+    const current = recording;
+    current.extraTimer = setTimeout(() => {
+      if (!active() || recording !== current || recording.extraPrivate !== pending) return;
+      current.extraTimer = null;
+      if (performance.now()-current.started >= durationMs) { stop('deadline'); return; }
+      if (document.hidden || !document.hasFocus() || document.activeElement !== editor) { cancelExtra('focus-or-visibility'); return; }
+      if (isEditorComposing) { cancelExtra('composition'); return; }
+      if (editor.value !== pending.value) { cancelExtra('document-content-changed'); return; }
+      if (editor.selectionStart !== pending.start || editor.selectionEnd !== pending.end ||
+          editor.selectionDirection !== pending.direction || editor.selectionStart !== editor.selectionEnd) { cancelExtra('selection-changed'); return; }
+      const box = geometry(), initial = pending.geometry;
+      if (!box || !initial || Math.abs(box.scale-1)>0.01 ||
+          ['height','width','rootHeight','rootWidth'].some(key=>Math.abs(box[key]-initial[key])>=2) ||
+          !ipadKeyboardTrial.isCurrentSession(sessionId)) { cancelExtra('keyboard-or-layout-changed'); return; }
+      const before = editor.scrollTop, maximum = editor.scrollHeight-editor.clientHeight;
+      if (!Number.isFinite(before) || !Number.isFinite(maximum) || before < 0 || before > maximum || maximum <= 0) {
+        cancelExtra('outside-scroll-range'); return;
+      }
+      if (before !== pending.top) { cancelExtra('scroll-position-changed'); return; }
+      if (before === 0) { cancelExtra('at-start'); return; }
+      const target = Math.max(0,before-extraDistance);
+      Object.assign(summary, { executed:true, executedAtMs:time(), before, target });
+      capture('extra-before', { sessionId, before, target, restoreExpected:false });
+      editor.scrollTop = target;
+      const after = editor.scrollTop, delta = after-before;
+      Object.assign(summary, { after, actualDelta:delta, actualDistance:-delta, moved:after<before && after>=0,
+        fullDistance:Math.abs(delta+extraDistance)<0.01, completedAtMs:time(), status:'completed',
+        reason:after<before && after>=0 ? null : 'no-actual-movement' });
+      capture('extra-after', { sessionId, before, target, after, actualDelta:delta, moved:summary.moved, restoreExpected:false });
+      current.extraPrivate = null;
+    }, extraDelayMs);
+  }
   function stop(reason = 'manual') {
     if (!active()) return;
+    cancelExtra(reason);
+    if (recording.mode === 'extra' && !recording.experiment.originDetected && !recording.experiment.reason)
+      Object.assign(recording.experiment,{status:'not-triggered',reason:'no-new-successful-correction'});
+    recording.experiment.endedAtMs=time();
     capture('recording-stop', { reason });
     recording.running = false;
     clearTimeout(recording.sampleTimer); clearTimeout(recording.endTimer);
@@ -4651,10 +4711,15 @@ const ipadKeyboardRecording = (() => {
     recording.removeListeners = [];
     recording.gestures.clear();
   }
-  function start() {
+  function start(mode = 'record') {
+    if (!['record','extra'].includes(mode)) throw new Error('Unknown recording mode');
     stop('restart');
-    recording = { running:true, started:performance.now(), entries:[], dropped:0, removeListeners:[], gestures:new Map(),
-      environment:{ build, trial:ipadKeyboardTrial.description(), durationMs, maxEntries, sampleMs:100,
+    recording = { mode, running:true, started:performance.now(), entries:[],
+      experiment:{ build, mode, enabled:mode==='extra', distance:extraDistance, delayMs:extraDelayMs, restoreExpected:false,
+        status:mode==='extra'?'waiting-origin':'disabled', originDetected:false, originAtMs:null, originBefore:null, originAfter:null,
+        scheduled:false, scheduledAtMs:null, executed:false, executedAtMs:null, moved:null, fullDistance:null,
+        reason:null, cancelledAtMs:null, completedAtMs:null, endedAtMs:null }, dropped:0, removeListeners:[], gestures:new Map(),
+      environment:{ build, mode, extraDistance, extraDelayMs, trial:ipadKeyboardTrial.description(), durationMs, maxEntries, sampleMs:100,
         ipad:isIPadOS || /iPad/i.test(navigator.userAgent),
         standalone:navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches,
         visualViewport:!!window.visualViewport, userAgent:navigator.userAgent,
@@ -4695,6 +4760,28 @@ const ipadKeyboardRecording = (() => {
     for (const name of ['resize','scroll']) listen(window.visualViewport,name,()=>metadata('viewport-'+name));
     listen(document,'visibilitychange',()=>{ metadata('visibilitychange'); if(document.hidden) stop('hidden'); });
     listen(window,'pagehide',()=>stop('pagehide'));
+    for (const name of ['pointerdown','touchstart','wheel']) listen(window,name,()=>cancelExtra('manual-operation'),true);
+    for (const name of ['beforeinput','input','compositionstart']) listen(editor,name,()=>cancelExtra(name));
+    listen(document,'selectionchange',()=>{
+      const pending=recording.extraPrivate;
+      if(pending && (editor.selectionStart!==pending.start || editor.selectionEnd!==pending.end || editor.selectionDirection!==pending.direction)) cancelExtra('selection-changed');
+    });
+    listen(editor,'scroll',()=>{
+      const pending=recording.extraPrivate;
+      // The normal 1px correction's queued event is expected at this same position.
+      if(pending && editor.scrollTop!==pending.top) cancelExtra('scroll-position-changed');
+    });
+    for(const name of ['blur','orientationchange']) listen(window,name,()=>cancelExtra('window-'+name));
+    listen(editor,'blur',()=>cancelExtra('editor-blur'));
+    const checkGeometry=()=>{
+      const pending=recording.extraPrivate;
+      if(!pending)return;
+      const box=geometry(), initial=pending.geometry;
+      if(!box || !initial || Math.abs(box.scale-1)>0.01 ||
+         ['height','width','rootHeight','rootWidth'].some(key=>Math.abs(box[key]-initial[key])>=2)) cancelExtra('keyboard-or-layout-changed');
+    };
+    listen(window,'resize',checkGeometry);
+    for(const name of ['resize','scroll']) listen(window.visualViewport,name,checkGeometry);
     capture('recording-start');
     const current = recording;
     const sample = () => {
@@ -4706,10 +4793,10 @@ const ipadKeyboardRecording = (() => {
     current.endTimer=setTimeout(()=>stop('deadline'),durationMs);
   }
   function result() {
-    return { build, running:active(), environment:recording?.environment || null,
+    return { build, mode:recording?.mode || null, experiment:recording ? { ...recording.experiment } : null, running:active(), environment:recording?.environment || null,
       dropped:recording?.dropped || 0, entries:recording?.entries.slice() || [] };
   }
-  return { build, active, event, markUI, capture, start, stop, result };
+  return { build, extraDistance, extraDelayMs, active, event, markUI, capture, onCorrection, cancelExtra, start, stop, result };
 })();
 
 function showIpadKeyboardRecording() {
@@ -4725,8 +4812,10 @@ function showIpadKeyboardRecording() {
       <p>iPad画面記録 ${ipadKeyboardRecording.build}</p>
       <p>キーボードを閉じ、長文の表示位置を準備して記録開始。下側をタップし、キーボード開閉を観察してください。観察後にここからJSONを取得します。</p>
       <p>記録は30秒・最大1500件。本文とファイル名は記録しません。計測が再現性に影響する可能性があります。</p>
-      <p>${ipadKeyboardRecording.active() ? '記録中' : '停止中'}</p>
-      <button type="button" data-record="start">記録開始</button>
+      <p>${ipadKeyboardRecording.active() ? '記録中' : '停止中'} / ${ipadKeyboardRecording.result().mode === 'extra' ? '追加移動実験' : '記録のみ'}</p>
+      <p>追加移動実験は通常の1px補正が成功した${ipadKeyboardRecording.extraDelayMs}ms後、先頭側へ追加で${ipadKeyboardRecording.extraDistance}px移動して保持します。下側をタップ後3秒待って閉じ、観察中は追加操作をしないでください。</p>
+      <button type="button" data-record="start">記録のみで開始</button>
+      <button type="button" data-record="extra">追加移動実験を開始</button>
       <button type="button" data-record="export">終了してJSON取得</button>
       <button type="button" data-record="stop">記録終了</button>
       <button type="button" data-record="close">閉じる</button>
@@ -4735,7 +4824,7 @@ function showIpadKeyboardRecording() {
     const action=e.target.dataset.record;
     if(!action)return;
     panel.remove();
-    if(action==='start')ipadKeyboardRecording.start();
+    if(action==='start'||action==='extra')ipadKeyboardRecording.start(action==='extra'?'extra':'record');
     if(action==='stop')ipadKeyboardRecording.stop();
     if(action==='export'){
       ipadKeyboardRecording.stop('export');
@@ -4785,6 +4874,7 @@ const ipadKeyboardTrial = (() => {
     last = `操作介入で取消（${reason}）`;
   }
   function end(reason) {
+    ipadKeyboardRecording.cancelExtra(reason);
     trace('trial-end',{reason});
     if (session && timer === null && last.startsWith('先頭のため')) session.done = true;
     cancel(reason);
@@ -4833,6 +4923,7 @@ const ipadKeyboardTrial = (() => {
     // Even a rounded/no-op assignment is not retried in a loop.
     session.done = true;
     last = actual < original && actual >= 0 ? `実行済み（${original}→${actual}px）` : '対象外（設定したが実移動なし）';
+    ipadKeyboardRecording.onCorrection(session.id, original, actual);
   }
   function schedule() {
     trace('trial-schedule',{delayMs:500,replacesPending:timer!==null});
@@ -4920,7 +5011,7 @@ const ipadKeyboardTrial = (() => {
           (editor.selectionStart !== candidate.start || editor.selectionEnd !== candidate.end))) cancel('選択変更');
     });
   }
-  return { setup, documentChanged:() => cancel('文書切替'), description:() => `${build} / ${last}` };
+  return { setup, isCurrentSession:id=>session?.id===id, documentChanged:() => { ipadKeyboardRecording.cancelExtra('document-changed'); cancel('文書切替'); }, description:() => `${build} / ${last}` };
 })();
 
 let viewportRefreshTimer = null;
