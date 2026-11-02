@@ -1836,6 +1836,7 @@ body.zen-mode #zen-exit-btn { display: flex; }
   <div class="menu-item">
     <button class="menu-trigger" data-menu="help" id="t-help"></button>
     <div class="menu-dropdown" id="dd-help">
+      <div class="menu-entry" data-keyboard-recording-open onclick="showIpadKeyboardRecording()">iPad画面記録（一時調査用）</div>
       <div class="menu-entry" onclick="showQuickStart()">
         <span id="m-help-quick-start"></span>
       </div>
@@ -4600,16 +4601,168 @@ document.querySelectorAll('.menu-trigger').forEach(btn => {
 document.addEventListener('click', closeMenus);
 document.addEventListener('fullscreenchange', handleFullscreenLayoutChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenLayoutChange);
+// Opt-in, bounded recording. All geometry reads are behind active().
+const ipadKeyboardRecording = (() => {
+  const build = 'ipad-keyboard-recording-20261102-1';
+  const durationMs = 30000, maxEntries = 1500;
+  let recording = null;
+  const active = () => !!recording?.running;
+  const time = () => Math.round((performance.now() - recording.started) * 10) / 10;
+  function viewport() {
+    const v = window.visualViewport;
+    return v ? { height:v.height, width:v.width, offsetTop:v.offsetTop, offsetLeft:v.offsetLeft,
+      pageTop:v.pageTop, scale:v.scale } : null;
+  }
+  function append(kind, details = {}) {
+    if (!recording) return;
+    if (recording.entries.length >= maxEntries) { recording.entries.shift(); recording.dropped++; }
+    recording.entries.push({ ms:time(), kind, ...details });
+  }
+  function event(kind, details = {}) {
+    if (active()) append(kind, details);
+  }
+  function markUI() {
+    append('recording-ui-open', { afterStop:!active() });
+  }
+  function capture(kind, details = {}) {
+    if (!active()) return;
+    const box = el => {
+      const r = el.getBoundingClientRect();
+      return { top:r.top, left:r.left, width:r.width, height:r.height,
+        scrollTop:el.scrollTop, scrollLeft:el.scrollLeft, scrollHeight:el.scrollHeight, clientHeight:el.clientHeight };
+    };
+    const a = document.activeElement, root = document.documentElement, scroller = document.scrollingElement;
+    event(kind, { ...details, viewport:viewport(), editor:box(editor), backdrop:box(backdrop),
+      app:box(document.body), root:box(root), scrollingElement:scroller ? box(scroller) : null,
+      innerHeight:window.innerHeight, scrollX:window.scrollX, scrollY:window.scrollY,
+      appliedHeight:document.body.style.getPropertyValue('--app-viewport-height'),
+      appliedTop:document.body.style.getPropertyValue('--app-viewport-top'),
+      selection:[editor.selectionStart,editor.selectionEnd,editor.selectionDirection],
+      textLength:editor.value.length, composing:isEditorComposing,
+      visibility:document.visibilityState, hasFocus:document.hasFocus(),
+      activeElement:a ? { tag:a.tagName, id:a.id } : null });
+  }
+  function stop(reason = 'manual') {
+    if (!active()) return;
+    capture('recording-stop', { reason });
+    recording.running = false;
+    clearTimeout(recording.sampleTimer); clearTimeout(recording.endTimer);
+    for (const remove of recording.removeListeners) remove();
+    recording.removeListeners = [];
+    recording.gestures.clear();
+  }
+  function start() {
+    stop('restart');
+    recording = { running:true, started:performance.now(), entries:[], dropped:0, removeListeners:[], gestures:new Map(),
+      environment:{ build, trial:ipadKeyboardTrial.description(), durationMs, maxEntries, sampleMs:100,
+        ipad:isIPadOS || /iPad/i.test(navigator.userAgent),
+        standalone:navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches,
+        visualViewport:!!window.visualViewport, userAgent:navigator.userAgent,
+        orientation:screen.orientation ? { type:screen.orientation.type, angle:screen.orientation.angle } : window.orientation,
+        initialViewport:viewport(), rootWidth:document.documentElement.clientWidth, rootHeight:document.documentElement.clientHeight } };
+    const listen = (target, name, fn, capture = false) => {
+      if (!target) return;
+      const options = { passive:true, capture };
+      target.addEventListener(name,fn,options);
+      recording.removeListeners.push(()=>target.removeEventListener(name,fn,options));
+    };
+    const metadata = name => event(name, { viewport:viewport(), scrollTop:editor.scrollTop,
+      scrollY:window.scrollY, selection:[editor.selectionStart,editor.selectionEnd,editor.selectionDirection],
+      composing:isEditorComposing, textLength:editor.value.length });
+    for (const name of ['pointerdown','pointerup','pointercancel','touchstart','touchend','touchcancel']) listen(editor,name,e=>{
+      const point = e.changedTouches?.[0] || e;
+      const key = name.startsWith('touch') ? `touch-${point.identifier}` : `pointer-${e.pointerId}`;
+      const begin = name==='pointerdown' || name==='touchstart';
+      const previous = recording.gestures.get(key);
+      const y = Number.isFinite(point.clientY) ? point.clientY : null;
+      const x = Number.isFinite(point.clientX) ? point.clientX : null;
+      const deltaY = !begin && previous && y !== null ? y - previous.y : null;
+      event(name, { clientX:x, clientY:y, target:{ tag:'TEXTAREA', id:'editor' },
+        deltaY, fingerDirection:deltaY === null ? null : deltaY>0 ? 'screen-down' : deltaY<0 ? 'screen-up' : 'stationary',
+        scrollTop:editor.scrollTop, scrollDelta:!begin && previous ? editor.scrollTop-previous.top : null });
+      if (begin) recording.gestures.set(key,{ y, top:editor.scrollTop });else recording.gestures.delete(key);
+    },true);
+    // Capture the user's intent before the help button can take focus.
+    for (const name of ['pointerdown','touchstart','keydown']) listen(window,name,e=>{
+      if (e.target.closest?.('[data-menu="help"], [data-keyboard-recording-open]')) event('recording-ui-intent',{ event:name });
+    },true);
+    for (const name of ['focus','blur','scroll','compositionstart','compositionend']) listen(editor,name,()=>metadata('editor-'+name));
+    for (const name of ['beforeinput','input']) listen(editor,name,e=>event(name,{ inputType:e.inputType || '',
+      textLength:editor.value.length, selection:[editor.selectionStart,editor.selectionEnd,editor.selectionDirection],
+      composing:isEditorComposing || !!e.isComposing }));
+    listen(document,'selectionchange',()=>metadata('selectionchange'));
+    for (const name of ['focus','blur','scroll','resize','orientationchange']) listen(window,name,()=>metadata('window-'+name));
+    for (const name of ['resize','scroll']) listen(window.visualViewport,name,()=>metadata('viewport-'+name));
+    listen(document,'visibilitychange',()=>{ metadata('visibilitychange'); if(document.hidden) stop('hidden'); });
+    listen(window,'pagehide',()=>stop('pagehide'));
+    capture('recording-start');
+    const current = recording;
+    const sample = () => {
+      if (!active() || recording !== current) return;
+      if (performance.now()-current.started >= durationMs) { stop('deadline'); return; }
+      capture('sample'); current.sampleTimer=setTimeout(sample,100);
+    };
+    current.sampleTimer=setTimeout(sample,100);
+    current.endTimer=setTimeout(()=>stop('deadline'),durationMs);
+  }
+  function result() {
+    return { build, running:active(), environment:recording?.environment || null,
+      dropped:recording?.dropped || 0, entries:recording?.entries.slice() || [] };
+  }
+  return { build, active, event, markUI, capture, start, stop, result };
+})();
+
+function showIpadKeyboardRecording() {
+  ipadKeyboardRecording.markUI();
+  closeMenus();
+  if (document.getElementById('ipad-keyboard-recording-panel')) return;
+  const panel = document.createElement('div');
+  panel.id='ipad-keyboard-recording-panel';panel.setAttribute('role','dialog');panel.setAttribute('aria-modal','true');
+  panel.setAttribute('aria-label','iPad画面記録');
+  panel.style.cssText='position:fixed;inset:0;z-index:30000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center';
+  panel.innerHTML=`<style>#ipad-keyboard-recording-panel button{min-height:44px;margin:4px;padding:10px;font:inherit;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px}</style>
+    <div style="padding:24px;background:var(--surface);color:var(--text);max-width:560px;max-height:90%;overflow:auto">
+      <p>iPad画面記録 ${ipadKeyboardRecording.build}</p>
+      <p>キーボードを閉じ、長文の表示位置を準備して記録開始。下側をタップし、キーボード開閉を観察してください。観察後にここからJSONを取得します。</p>
+      <p>記録は30秒・最大1500件。本文とファイル名は記録しません。計測が再現性に影響する可能性があります。</p>
+      <p>${ipadKeyboardRecording.active() ? '記録中' : '停止中'}</p>
+      <button type="button" data-record="start">記録開始</button>
+      <button type="button" data-record="export">終了してJSON取得</button>
+      <button type="button" data-record="stop">記録終了</button>
+      <button type="button" data-record="close">閉じる</button>
+    </div>`;
+  panel.addEventListener('click',e=>{
+    const action=e.target.dataset.record;
+    if(!action)return;
+    panel.remove();
+    if(action==='start')ipadKeyboardRecording.start();
+    if(action==='stop')ipadKeyboardRecording.stop();
+    if(action==='export'){
+      ipadKeyboardRecording.stop('export');
+      triggerDownload(JSON.stringify(ipadKeyboardRecording.result(),null,2),'mdworks-ipad-recording.json','application/json');
+    }
+  });
+  document.body.appendChild(panel);
+}
+
 // Trial workaround based on the iPad standalone C experiment.
 const ipadKeyboardTrial = (() => {
   const build = 'ipad-keyboard-trial-20261102-1';
   let session = null;
+  let nextSessionId = 0;
   let baseline = null;
   let timer = null;
   let frame = null;
   let beforeInputTop = null;
   let candidate = null;
   let last = '対象外（キーボード表示待ち）';
+  function trace(kind, detail = {}) {
+    if (!ipadKeyboardRecording.active()) return;
+    ipadKeyboardRecording.event(kind, { sessionId:session?.id || null, done:session?.done || false,
+      pending:timer !== null, baseline:baseline ? { ...baseline } : null,
+      candidate:candidate ? { top:candidate.top, start:candidate.start, end:candidate.end, direction:candidate.direction } : null,
+      ...detail });
+  }
   function bounds() {
     const viewport = window.visualViewport;
     return { height:viewport.height, width:viewport.width,
@@ -4625,12 +4778,14 @@ const ipadKeyboardTrial = (() => {
     beforeInputTop = null;
   }
   function cancel(reason) {
-    if (!session || session.done) return;
+    if (!session || session.done) { trace('trial-cancel-skipped',{reason}); return; }
+    trace('trial-cancel',{reason});
     clearPending();
     session.done = true;
     last = `操作介入で取消（${reason}）`;
   }
   function end(reason) {
+    trace('trial-end',{reason});
     if (session && timer === null && last.startsWith('先頭のため')) session.done = true;
     cancel(reason);
     session = null;
@@ -4644,7 +4799,15 @@ const ipadKeyboardTrial = (() => {
   }
   function run() {
     timer = null;
-    if (!session || session.done) return;
+    trace('trial-timer-fired');
+    if (!session || session.done) { trace('trial-run-skipped',{reason:'no-active-session'}); return; }
+    if (ipadKeyboardRecording.active()) trace('trial-preconditions', { checks:{
+      visible:!document.hidden, hasFocus:document.hasFocus(), editorFocused:document.activeElement===editor,
+      unzoomed:unzoomed(), notComposing:!isEditorComposing, sameLayout:!!sameLayout(bounds()),
+      sameDocument:editor.value===(candidate ? candidate.value : session.value),
+      collapsed:editor.selectionStart===editor.selectionEnd,
+      candidateSelectionMatches:!candidate || (editor.selectionStart===candidate.start && editor.selectionEnd===candidate.end && editor.selectionDirection===candidate.direction)
+    }, currentBounds:bounds() });
     if (document.hidden || !document.hasFocus() || document.activeElement !== editor || !unzoomed() || isEditorComposing ||
         !sameLayout(bounds())) { cancel('編集状態または画面変更'); return; }
     if (editor.value !== (candidate ? candidate.value : session.value)) { cancel('文書内容変更'); return; }
@@ -4654,49 +4817,59 @@ const ipadKeyboardTrial = (() => {
     const original = editor.scrollTop;
     const maximum = editor.scrollHeight - editor.clientHeight;
     // Input-triggered work requires an actual scroll since beforeinput.
-    if (original === 0) { candidate = null; last = '先頭のため実移動なし（入力待ち）'; return; }
-    if (candidate && original === candidate.top) { candidate = null; last = '対象外（入力後の自動スクロールなし）'; return; }
+    if (original === 0) { candidate = null; trace('trial-run-skipped',{reason:'at-start'}); last = '先頭のため実移動なし（入力待ち）'; return; }
+    if (candidate && original === candidate.top) { candidate = null; trace('trial-run-skipped',{reason:'no-input-scroll'}); last = '対象外（入力後の自動スクロールなし）'; return; }
     candidate = null;
     if (!Number.isFinite(original) || original < 0 || original > maximum || maximum <= 0) {
+      trace('trial-run-skipped',{reason:'outside-range',original,maximum});
       session.done = true; last = '対象外（通常スクロール範囲外）'; return;
     }
+    trace('trial-apply',{original,target:Math.max(0,original-1)});
+    ipadKeyboardRecording.capture('trial-before',{original,target:Math.max(0,original-1)});
     editor.scrollTop = Math.max(0, original - 1);
     const actual = editor.scrollTop;
+    ipadKeyboardRecording.capture('trial-after',{original,actual});
+    trace('trial-applied',{original,actual,moved:actual<original && actual>=0});
     // Even a rounded/no-op assignment is not retried in a loop.
     session.done = true;
     last = actual < original && actual >= 0 ? `実行済み（${original}→${actual}px）` : '対象外（設定したが実移動なし）';
   }
   function schedule() {
+    trace('trial-schedule',{delayMs:500,replacesPending:timer!==null});
     clearTimeout(timer);
     timer = setTimeout(run, 500);
   }
   function observeViewport() {
     frame = null;
     const box = bounds();
-    if (!Number.isFinite(box.height) || box.height <= 0 || !Number.isFinite(box.width) || box.width <= 0) return;
+    trace('trial-viewport-check',{currentBounds:box});
+    if (!Number.isFinite(box.height) || box.height <= 0 || !Number.isFinite(box.width) || box.width <= 0) { trace('trial-detection-skipped',{reason:'invalid-bounds'}); return; }
     if (!unzoomed()) { end('拡大操作'); baseline = null; return; }
     if (!baseline) {
       if (Math.abs(box.height - box.rootHeight) < 2) baseline = box;
+      trace('trial-detection-skipped',{reason:'baseline-recovery'});
       return;
     }
     if (baseline && !sameLayout(box)) { end('画面サイズ変更'); baseline = null; return; }
     if (session && box.height >= baseline.height - 2) { end('キーボード終了'); baseline = box; return; }
     if (session) {
+      trace('trial-existing-session');
       if (!session.done && !candidate) schedule();
       return;
     }
-    if (document.activeElement !== editor || document.hidden || !document.hasFocus()) return;
+    if (document.activeElement !== editor || document.hidden || !document.hasFocus()) { trace('trial-detection-skipped',{reason:'focus-or-visibility',editorFocused:document.activeElement===editor,hidden:document.hidden,hasFocus:document.hasFocus()}); return; }
     if (!baseline) return;
     const reduction = baseline.height - box.height;
-    if (reduction < Math.max(120, baseline.height * 0.18)) return;
-    session = { done:false, start:editor.selectionStart, end:editor.selectionEnd, value:editor.value };
+    if (reduction < Math.max(120, baseline.height * 0.18)) { trace('trial-detection-skipped',{reason:'insufficient-shrink',reduction,threshold:Math.max(120,baseline.height*0.18)}); return; }
+    session = { id:++nextSessionId, done:false, start:editor.selectionStart, end:editor.selectionEnd, value:editor.value };
+    trace('trial-session-start',{reduction});
     last = '予約済み（表示後の調整待ち）';
     schedule();
   }
   function setup() {
     const ipad = isIPadOS || /iPad/i.test(navigator.userAgent);
     const standalone = navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
-    if (!ipad || !standalone || !window.visualViewport) return;
+    if (!ipad || !standalone || !window.visualViewport) { trace('trial-setup-excluded',{ipad,standalone,visualViewport:!!window.visualViewport}); return; }
     last = '対象外（キーボード表示待ち）';
     baseline = bounds();
     editor.addEventListener('focus', () => {
@@ -4797,11 +4970,14 @@ function keepEditorCaretVisibleAfterResize() {
     const margin = Math.min(8, editor.clientHeight / 4);
     const caretBottom = caretTop + lineHeight;
     if (caretBottom > editor.scrollTop + editor.clientHeight - margin) {
+      ipadKeyboardRecording.capture('caret-adjust-before',{direction:'down'});
       editor.scrollTop = Math.max(0, caretBottom - editor.clientHeight + margin);
     } else if (caretTop < editor.scrollTop + margin) {
+      ipadKeyboardRecording.capture('caret-adjust-before',{direction:'up'});
       editor.scrollTop = Math.max(0, caretTop - margin);
     }
   } finally {
+    ipadKeyboardRecording.capture('caret-adjust-after');
     mirror.remove();
     syncEditorBackdropScroll();
   }
@@ -4822,6 +4998,7 @@ function updateVisualViewportLayout() {
   const topChanged = !previous || Math.abs(top - previous.top) >= 0.5;
   if (!sizeChanged && !topChanged) return;
 
+  ipadKeyboardRecording.event('viewport-apply',{height,top,width});
   const previousEditorHeight = editor.clientHeight;
   document.body.style.setProperty('--app-viewport-height', `${height}px`);
   document.body.style.setProperty('--app-viewport-top', `${top}px`);
