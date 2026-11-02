@@ -11,7 +11,13 @@
       sizes="180x180"
       href="images/apple-touch-icon-180.png">
 <script>
-  if (location.protocol === 'https:' && location.pathname.startsWith('/markdown-editor/')) {
+  if (
+    location.protocol === 'https:' &&
+    (
+      location.pathname.startsWith('/markdown-editor/') ||
+      location.pathname.startsWith('/publictest/')
+    )
+  ) {
     const manifestLink = document.createElement('link');
     manifestLink.rel = 'manifest';
     manifestLink.href = 'manifest.json';
