@@ -11,13 +11,7 @@
       sizes="180x180"
       href="images/apple-touch-icon-180.png">
 <script>
-  if (
-    location.protocol === 'https:' &&
-    (
-      location.pathname.startsWith('/markdown-editor/') ||
-      location.pathname.startsWith('/publictest/')
-    )
-  ) {
+  if (location.protocol === 'https:' && location.pathname.startsWith('/markdown-editor/')) {
     const manifestLink = document.createElement('link');
     manifestLink.rel = 'manifest';
     manifestLink.href = 'manifest.json';
@@ -1850,7 +1844,6 @@ body.zen-mode #zen-exit-btn { display: flex; }
       <div class="menu-entry" onclick="showAboutMdworks()">
         <span id="m-help-about"></span>
       </div>
-      <div class="menu-entry" onclick="showKeyboardDiagnostics()">iPadキーボード診断（実験用）</div>
     </div>
   </div>
   <button
@@ -4579,6 +4572,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderFullscreenMenuCheck();
   setupLayoutResizeObserver();
   setupVisualViewport();
+  ipadKeyboardTrial.setup();
   syncFilenameInputState();
   updateBrowserTabTitle();
   maybeShowReleaseNotes(); // 起動時の復元・初期描画後に、このバージョン未表示なら表示
@@ -4600,286 +4594,155 @@ document.querySelectorAll('.menu-trigger').forEach(btn => {
 document.addEventListener('click', closeMenus);
 document.addEventListener('fullscreenchange', handleFullscreenLayoutChange);
 document.addEventListener('webkitfullscreenchange', handleFullscreenLayoutChange);
-// Temporary opt-in experiment. No listeners, timers or geometry reads until Start.
-const keyboardDiagnostics = (() => {
-  const BUILD = 'ipad-diag-20261030-3', DURATION = 30000, MAX_LOGS = 2000;
-  const TARGET_NEWLINES = 7, ACTION_DELAY_MS = 500;
-  let run = null;
-  const active = () => !!run?.running;
-  function note(kind, detail = {}) {
-    if (!active()) return;
-    const entry = { ms: Math.round((performance.now() - run.started) * 10) / 10, kind, ...detail };
-    if (run.logs.length >= MAX_LOGS) { run.logs.shift(); run.dropped++; }
-    run.logs.push(entry);
+// Trial workaround based on the iPad standalone C experiment.
+const ipadKeyboardTrial = (() => {
+  const build = 'ipad-keyboard-trial-20261102-1';
+  let session = null;
+  let baseline = null;
+  let timer = null;
+  let frame = null;
+  let beforeInputTop = null;
+  let candidate = null;
+  let last = '対象外（キーボード表示待ち）';
+  function bounds() {
+    const viewport = window.visualViewport;
+    return { height:viewport.height, width:viewport.width,
+      rootHeight:document.documentElement.clientHeight, rootWidth:document.documentElement.clientWidth };
   }
-  function snapshot(kind, detail = {}) {
-    if (!active()) return;
-    const box = el => {
-      const r = el.getBoundingClientRect();
-      return { top:r.top, left:r.left, width:r.width, height:r.height,
-        scrollTop:el.scrollTop, scrollLeft:el.scrollLeft, scrollHeight:el.scrollHeight, clientHeight:el.clientHeight };
-    };
-    const v = window.visualViewport, a = document.activeElement;
-    note(kind, { ...detail, textLength:editor.value.length, lines:editor.value.split('\n').length,
-      selection:[editor.selectionStart, editor.selectionEnd, editor.selectionDirection], composing:isEditorComposing,
-      editor:box(editor), backdrop:box(backdrop), body:box(document.body), root:box(document.documentElement),
-      scrollingElement:document.scrollingElement ? { top:document.scrollingElement.scrollTop, height:document.scrollingElement.scrollHeight } : null,
-      viewport:v ? { height:v.height, width:v.width, offsetTop:v.offsetTop, pageTop:v.pageTop, scale:v.scale } : null,
-      innerHeight:window.innerHeight, scrollY:window.scrollY,
-      appliedHeight:document.body.style.getPropertyValue('--app-viewport-height'),
-      appliedTop:document.body.style.getPropertyValue('--app-viewport-top'),
-      visibility:document.visibilityState, hasFocus:document.hasFocus(),
-      activeElement:a ? { tag:a.tagName, id:a.id } : null });
+  function unzoomed() {
+    return window.visualViewport && Math.abs(window.visualViewport.scale - 1) <= 0.01;
   }
-  function clearAction() {
-    if (!run) return;
-    clearTimeout(run.actionTimer); run.actionTimer = null;
-    for (const id of run.frames) cancelAnimationFrame(id);
-    run.frames.clear();
+  function clearPending() {
+    clearTimeout(timer);
+    timer = null;
+    candidate = null;
+    beforeInputTop = null;
   }
-  const elapsed = () => Math.round((performance.now() - run.started) * 10) / 10;
-  function fail(status, reason) {
-    if (!active() || run.summary.reason || run.summary.status === 'completed') return;
-    Object.assign(run.summary, { status, reason, failureAtMs:elapsed() });
-    run.valid = false;
-    note(status === 'invalid' ? 'sequence-invalid' :
-      status === 'not-triggered' ? 'experiment-not-triggered' : 'action-aborted', { reason });
+  function cancel(reason) {
+    if (!session || session.done) return;
+    clearPending();
+    session.done = true;
+    last = `操作介入で取消（${reason}）`;
   }
-  function interrupt(reason) {
-    if (!active()) return;
-    run.revision++;
-    if (run.pending) {
-      fail('aborted', reason); run.pending = false; clearAction();
-    }
+  function end(reason) {
+    if (session && timer === null && last.startsWith('先頭のため')) session.done = true;
+    cancel(reason);
+    session = null;
+    if (frame !== null) cancelAnimationFrame(frame);
+    frame = null;
+    clearPending();
   }
-  function intervene(reason) {
-    interrupt(reason);
-    if (active() && run.armed && run.count > 0 && !run.fired) fail('invalid', reason);
+  function sameLayout(box) {
+    return baseline && Math.abs(box.width - baseline.width) < 2 &&
+      Math.abs(box.rootWidth - baseline.rootWidth) < 2 && Math.abs(box.rootHeight - baseline.rootHeight) < 2;
   }
-  function stop(reason = 'manual') {
-    if (!active()) return;
-    interrupt(reason);
-    if (!run.summary.reason && run.summary.status !== 'completed') {
-      fail('not-triggered', !run.armed ? 'waiting-for-new-document' : 'target-not-reached');
-    }
-    Object.assign(run.summary, { endedAtMs:elapsed(), endReason:reason });
-    snapshot('recording-stop', { reason });
-    clearTimeout(run.sampleTimer); clearTimeout(run.endTimer); clearAction();
-    for (const remove of run.removeListeners) remove();
-    run.removeListeners = []; run.running = false;
-  }
-  function arm(cause) {
-    if (!active() || run.fired || run.summary.reason) return;
-    run.armed = true; run.count = 0; run.valid = true;
-    Object.assign(run.summary, { armed:true, armedBy:cause, armedAtMs:elapsed(), status:'armed' });
-    snapshot('experiment-armed', { cause, targetNewlines:TARGET_NEWLINES });
-  }
-  function newDocument() {
-    if (!active()) return;
-    intervene('new-document');
-    if (editor.value !== '') { note('new-document-not-empty'); return; }
-    arm('new-file');
-    if (run.valid && !run.fired) snapshot('new-document-armed');
-  }
-  function eligible() {
-    return editor.value === '\n'.repeat(TARGET_NEWLINES) &&
-      editor.selectionStart === TARGET_NEWLINES && editor.selectionEnd === TARGET_NEWLINES &&
-      document.activeElement === editor && !isEditorComposing && !document.hidden;
-  }
-  function moveTowardStartOnce() {
+  function run() {
+    timer = null;
+    if (!session || session.done) return;
+    if (document.hidden || !document.hasFocus() || document.activeElement !== editor || !unzoomed() || isEditorComposing ||
+        !sameLayout(bounds())) { cancel('編集状態または画面変更'); return; }
+    if (editor.value !== (candidate ? candidate.value : session.value)) { cancel('文書内容変更'); return; }
+    if (editor.selectionStart !== editor.selectionEnd) { cancel('選択範囲'); return; }
+    if (candidate && (editor.selectionStart !== candidate.start || editor.selectionEnd !== candidate.end ||
+        editor.selectionDirection !== candidate.direction)) { cancel('選択位置変更'); return; }
     const original = editor.scrollTop;
-    const max = Math.max(0, editor.scrollHeight - editor.clientHeight);
-    let movementReason = null;
-    if (!Number.isFinite(original) || !Number.isFinite(max)) movementReason = 'invalid-scroll-bounds';
-    else if (max <= 0) movementReason = 'no-scroll-range';
-    else if (original < 0 || original > max) movementReason = 'outside-normal-scroll-range';
-    else if (original === 0) movementReason = 'at-start';
-    const target = movementReason ? null : Math.max(0, original - 1);
-    snapshot('C-before', { original, target, max, restoreExpected:false });
-    // One assignment only. Never normalize overscroll, restore or enforce position.
-    if (!movementReason) editor.scrollTop = target;
+    const maximum = editor.scrollHeight - editor.clientHeight;
+    // Input-triggered work requires an actual scroll since beforeinput.
+    if (original === 0) { candidate = null; last = '先頭のため実移動なし（入力待ち）'; return; }
+    if (candidate && original === candidate.top) { candidate = null; last = '対象外（入力後の自動スクロールなし）'; return; }
+    candidate = null;
+    if (!Number.isFinite(original) || original < 0 || original > maximum || maximum <= 0) {
+      session.done = true; last = '対象外（通常スクロール範囲外）'; return;
+    }
+    editor.scrollTop = Math.max(0, original - 1);
     const actual = editor.scrollTop;
-    const delta = actual - original;
-    const moved = Number.isFinite(delta) && delta !== 0;
-    if (!movementReason && !moved) movementReason = 'no-actual-movement';
-    else if (!movementReason && (!Number.isFinite(actual) || actual < 0 || actual >= original))
-      movementReason = 'unexpected-scroll-result';
-    Object.assign(run.summary, { originalScrollTop:original, targetScrollTop:target,
-      movedScrollTop:actual, actualDelta:delta, moved, movedAtMs:elapsed(), movementReason,
-      assignmentMade:target !== null, status:'completed', completedAtMs:elapsed() });
-    snapshot('C-moved', { original, target, actual, actualDelta:delta, moved, reason:movementReason,
-      assignmentMade:target !== null, restoreExpected:false });
-    run.pending = false;
+    // Even a rounded/no-op assignment is not retried in a loop.
+    session.done = true;
+    last = actual < original && actual >= 0 ? `実行済み（${original}→${actual}px）` : '対象外（設定したが実移動なし）';
   }
-  function onInput(e) {
-    interrupt('input');
-    snapshot('input', { inputType:e.inputType || '', eventComposing:!!e.isComposing });
-    if (!run.armed || run.fired || !run.valid) return;
-    const next = run.count + 1;
-    if (e.isComposing || isEditorComposing || next > TARGET_NEWLINES ||
-        !['insertLineBreak','insertParagraph','insertText'].includes(e.inputType) ||
-        editor.value !== '\n'.repeat(next) || editor.selectionStart !== next || editor.selectionEnd !== next) {
-      fail('invalid', e.isComposing || isEditorComposing ? 'composition-input' : 'unexpected-input-or-selection'); return;
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(run, 500);
+  }
+  function observeViewport() {
+    frame = null;
+    const box = bounds();
+    if (!Number.isFinite(box.height) || box.height <= 0 || !Number.isFinite(box.width) || box.width <= 0) return;
+    if (!unzoomed()) { end('拡大操作'); baseline = null; return; }
+    if (!baseline) {
+      if (Math.abs(box.height - box.rootHeight) < 2) baseline = box;
+      return;
     }
-    run.count = next;
-    run.summary.enteredNewlines = next;
-    run.summary.status = 'collecting';
-    if (next !== TARGET_NEWLINES) return;
-    run.fired = true; run.pending = true;
-    const current = run, revision = run.revision;
-    Object.assign(run.summary, { targetDetected:true, targetAtMs:elapsed(), status:'pending' });
-    snapshot('target-newline', { targetNewlines:TARGET_NEWLINES, delayMs:ACTION_DELAY_MS });
-    run.actionTimer = setTimeout(() => {
-      run.actionTimer = null;
-      if (performance.now() - current.started >= DURATION) { stop('deadline'); return; }
-      if (run !== current || !active() || revision !== run.revision || !eligible()) {
-        interrupt('conditions-changed'); return;
-      }
-      Object.assign(run.summary, { executed:true, executedAtMs:elapsed() });
-      if (run.mode === 'A') {
-        Object.assign(run.summary, { markerRecorded:true, status:'completed', completedAtMs:elapsed() });
-        snapshot('A-marker'); run.pending = false; return;
-      }
-      run.summary.status = 'executing';
-      if (run.mode === 'C') { moveTowardStartOnce(); return; }
-      const original = editor.scrollTop, max = Math.max(0, editor.scrollHeight - editor.clientHeight);
-      const target = original < max ? Math.min(max, original + 1) : Math.max(0, original - 1);
-      snapshot('B-before', { original, target, max });
-      editor.scrollTop = target;
-      const moved = editor.scrollTop;
-      Object.assign(run.summary, { moved:Math.abs(moved-original) > 0.01, movedAtMs:elapsed(),
-        originalScrollTop:original, targetScrollTop:target, movedScrollTop:moved });
-      snapshot('B-moved', { original, target, actual:moved, moved:run.summary.moved });
-      // Native scroll listeners keep the backdrop synchronized. Do not dispatch fake events.
-      const frame = fn => {
-        const id = requestAnimationFrame(() => { current.frames.delete(id); fn(); });
-        current.frames.add(id);
-      };
-      frame(() => frame(() => {
-        if (run !== current || !active()) return;
-        if (performance.now() - run.started >= DURATION) { stop('deadline'); return; }
-        if (revision !== run.revision || !eligible() || Math.abs(editor.scrollTop - moved) > 0.1) {
-          interrupt('restore-conditions-changed'); return;
-        }
-        editor.scrollTop = original;
-        Object.assign(run.summary, { restored:Math.abs(editor.scrollTop-original) <= 0.1,
-          restoredAtMs:elapsed(), restoredScrollTop:editor.scrollTop });
-        if (run.summary.restored) Object.assign(run.summary, { status:'completed', completedAtMs:elapsed() });
-        else fail('aborted', 'restore-not-achieved');
-        snapshot('B-restored', { original, actual:editor.scrollTop });
-        run.pending = false;
-      }));
-    }, ACTION_DELAY_MS);
-  }
-  function start(mode) {
-    if (!['A','B','C'].includes(mode)) throw new Error('Unknown diagnostic mode');
-    stop('restart');
-    run = { mode, running:true, started:performance.now(), logs:[], dropped:0, frames:new Set(),
-      removeListeners:[], revision:0, armed:false, fired:false, pending:false, valid:false, count:0,
-      summary:{ build:BUILD, mode, targetNewlines:TARGET_NEWLINES, status:'waiting-document',
-        restoreExpected:mode === 'B', movementReason:null,
-        armed:false, armedBy:null, armedAtMs:null, enteredNewlines:0, targetDetected:false, targetAtMs:null,
-        executed:false, executedAtMs:null, markerRecorded:false, moved:null, movedAtMs:null,
-        restored:null, restoredAtMs:null, completedAtMs:null, reason:null, failureAtMs:null, endedAtMs:null, endReason:null },
-      environment:{ build:BUILD, mode, standaloneMedia:window.matchMedia('(display-mode: standalone)').matches,
-        navigatorStandalone:navigator.standalone === true, userAgent:navigator.userAgent,
-        durationMs:DURATION, sampleIntervalMs:100, maxLogs:MAX_LOGS, actionDelayMs:ACTION_DELAY_MS, targetNewlines:TARGET_NEWLINES } };
-    const listen = (target, name, fn, capture = false) => {
-      if (!target) return;
-      const options = { passive:true, capture };
-      target.addEventListener(name, fn, options);
-      run.removeListeners.push(() => target.removeEventListener(name, fn, options));
-    };
-    listen(editor, 'input', onInput);
-    for (const name of ['compositionstart','compositionend']) listen(editor, name, () => {
-      interrupt(name); if (run.armed && !run.fired) fail('invalid', name); snapshot(name);
-    });
-    listen(document, 'selectionchange', () => {
-      if (run.pending && !eligible()) interrupt('selection-changed');
-      else if (run.armed && run.count > 0 && !run.fired &&
-        (document.activeElement !== editor || editor.selectionStart !== run.count || editor.selectionEnd !== run.count))
-        fail('invalid', 'selection-changed');
-    });
-    for (const name of ['touchstart','touchend','touchcancel','pointerdown','pointerup','wheel']) {
-      listen(document, name, () => {
-        intervene(name); snapshot(name);
-      }, true);
+    if (baseline && !sameLayout(box)) { end('画面サイズ変更'); baseline = null; return; }
+    if (session && box.height >= baseline.height - 2) { end('キーボード終了'); baseline = box; return; }
+    if (session) {
+      if (!session.done && !candidate) schedule();
+      return;
     }
-    listen(document, 'keydown', e => {
-      if (e.key !== 'Enter' || run.fired) {
-        intervene('keydown');
-      }
-    }, true);
-    listen(editor, 'scroll', () => snapshot('editor-scroll'));
-    listen(window, 'scroll', () => snapshot('page-scroll'));
-    for (const name of ['resize','scroll']) listen(window.visualViewport, name, () => snapshot('viewport-' + name));
-    for (const name of ['focus','blur']) listen(window, name, () => { intervene('window-' + name); snapshot('window-' + name); });
-    for (const name of ['focusin','focusout']) listen(document, name, () => { intervene(name); snapshot(name); });
-    listen(document, 'visibilitychange', () => {
-      interrupt('visibilitychange'); snapshot('visibilitychange'); if (document.hidden) stop('hidden');
+    if (document.activeElement !== editor || document.hidden || !document.hasFocus()) return;
+    if (!baseline) return;
+    const reduction = baseline.height - box.height;
+    if (reduction < Math.max(120, baseline.height * 0.18)) return;
+    session = { done:false, start:editor.selectionStart, end:editor.selectionEnd, value:editor.value };
+    last = '予約済み（表示後の調整待ち）';
+    schedule();
+  }
+  function setup() {
+    const ipad = isIPadOS || /iPad/i.test(navigator.userAgent);
+    const standalone = navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+    if (!ipad || !standalone || !window.visualViewport) return;
+    last = '対象外（キーボード表示待ち）';
+    baseline = bounds();
+    editor.addEventListener('focus', () => {
+      // Root geometry is unchanged by the overlaid iPad keyboard. Preserve a
+      // known full-height baseline if a failed close left visualViewport small.
+      const box = bounds();
+      if (!baseline || box.height > baseline.height || !sameLayout(box)) baseline = box;
     });
-    listen(window, 'pagehide', () => stop('pagehide'));
-    snapshot('recording-start');
-    if (editor.value === '') arm('empty-at-start');
-    const current = run;
-    const sample = () => {
-      if (run !== current || !active()) return;
-      if (performance.now() - run.started >= DURATION) { stop('deadline'); return; }
-      snapshot('sample'); run.sampleTimer = setTimeout(sample, 100);
+    editor.addEventListener('blur', () => end('本文フォーカス喪失'));
+    window.addEventListener('blur', () => end('ウィンドウフォーカス喪失'));
+    window.addEventListener('pagehide', () => end('ページ終了'));
+    document.addEventListener('visibilitychange', () => { if (document.hidden) end('非表示'); });
+    window.addEventListener('orientationchange', () => { end('画面回転'); baseline = null; });
+    window.addEventListener('resize', () => {
+      if (baseline && !sameLayout(bounds())) { end('画面サイズ変更'); baseline = null; }
+    });
+    const notify = () => {
+      if (frame === null) frame = requestAnimationFrame(observeViewport);
     };
-    run.sampleTimer = setTimeout(sample, 100);
-    run.endTimer = setTimeout(() => stop('deadline'), DURATION);
+    window.visualViewport.addEventListener('resize', notify, { passive:true });
+    window.visualViewport.addEventListener('scroll', notify, { passive:true });
+    editor.addEventListener('beforeinput', () => {
+      beforeInputTop = session && !session.done && !isEditorComposing ? editor.scrollTop : null;
+    });
+    editor.addEventListener('input', () => {
+      if (!session || session.done || isEditorComposing || beforeInputTop === null) return;
+      const top = candidate ? candidate.top : beforeInputTop;
+      candidate = { top, start:editor.selectionStart, end:editor.selectionEnd, direction:editor.selectionDirection, value:editor.value };
+      beforeInputTop = null;
+      session.value = editor.value;
+      session.start = editor.selectionStart;
+      session.end = editor.selectionEnd;
+      schedule();
+    });
+    // A candidate is bounded by its 500ms timer. No general scroll listener
+    // arms work, so a finger scroll alone cannot initiate the correction.
+    for (const event of ['pointerdown','touchstart','wheel']) {
+      document.addEventListener(event, () => cancel('手動操作'), { passive:true, capture:true });
+    }
+    editor.addEventListener('compositionstart', () => cancel('日本語変換'));
+    editor.addEventListener('keydown', event => {
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown','Escape'].includes(event.key)) cancel('選択操作');
+    });
+    document.addEventListener('selectionchange', () => {
+      if (!session || session.done) return;
+      if (editor.selectionStart !== editor.selectionEnd || (!candidate &&
+          (editor.selectionStart !== session.start || editor.selectionEnd !== session.end)) || (candidate &&
+          (editor.selectionStart !== candidate.start || editor.selectionEnd !== candidate.end))) cancel('選択変更');
+    });
   }
-  function result() {
-    return { build:BUILD, mode:run?.mode || null, running:active(), environment:run?.environment || null,
-      summary:run ? { ...run.summary } : null,
-      dropped:run?.dropped || 0, logs:run?.logs.slice() || [] };
-  }
-  return { build:BUILD, targetNewlines:TARGET_NEWLINES, start, stop, newDocument, note, snapshot, result, active };
+  return { setup, documentChanged:() => cancel('文書切替'), description:() => `${build} / ${last}` };
 })();
-
-function showKeyboardDiagnostics() {
-  closeMenus();
-  let panel = document.getElementById('keyboard-diagnostics-panel');
-  if (!panel) {
-    panel = document.createElement('div'); panel.id = 'keyboard-diagnostics-panel';
-    panel.setAttribute('role','dialog'); panel.setAttribute('aria-modal','true');
-    panel.setAttribute('aria-label','iPadキーボード診断');
-    panel.style.cssText = 'position:fixed;inset:0;z-index:30000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center';
-    panel.innerHTML = `<style>
-      #keyboard-diagnostics-panel p{margin-bottom:12px;line-height:1.6}
-      #keyboard-diagnostics-panel button{min-height:44px;padding:10px 14px;margin:4px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);font:inherit;cursor:pointer}
-    </style><div style="background:var(--surface);color:var(--text);padding:24px;max-width:560px;max-height:90%;overflow:auto;border:1px solid var(--border)">
-      <p>iPadキーボード診断 <span id="keyboard-diagnostics-status"></span></p>
-      <p>キーボードを閉じて開始してください。空文書なら開始後そのまま本文へ移れます。本文が空でなければ、開始後に「ファイル → 新規」を実行してください。30秒以内にEnterを${keyboardDiagnostics.targetNewlines}回（${keyboardDiagnostics.targetNewlines + 1}行目）。最後の入力から1秒待って右下ボタンで閉じ、閉じた直後と約1秒後の表示を観察し、観察が終わるまで画面に追加で触れないでください。</p>
-      <p>Bは${keyboardDiagnostics.targetNewlines}回目の入力の500ms後に本文を1px往復。Cは同じタイミングで行頭側へ1px移動し、元へ戻しません。位置の強制固定はしません。実験中の表示・通知はありません。</p>
-      <button type="button" data-diag="A">A：記録を開始</button>
-      <button type="button" data-diag="B">B：往復実験を開始</button>
-      <button type="button" data-diag="C">C：行頭側へ1px移動して保持</button>
-      <button type="button" data-diag="export">終了してJSON取得</button>
-      <button type="button" data-diag="stop">診断を停止</button>
-      <button type="button" data-diag="close">閉じる</button>
-      <p>ログはメモリのみ。本文・ファイル名は記録しません。再読み込みで消えます。計測自体が結果に影響する可能性があります。</p>
-    </div>`;
-    panel.addEventListener('click', e => {
-      const action = e.target.dataset.diag;
-      if (!action) return;
-      if (['A','B','C'].includes(action)) { panel.remove(); keyboardDiagnostics.start(action); return; }
-      if (action === 'export') {
-        keyboardDiagnostics.stop('export');
-        triggerDownload(JSON.stringify(keyboardDiagnostics.result(), null, 2), 'mdworks-ipad-diagnostic.json', 'application/json');
-      }
-      if (action === 'stop') keyboardDiagnostics.stop('disabled');
-      panel.remove();
-    });
-    document.body.appendChild(panel);
-  }
-  const result = keyboardDiagnostics.result();
-  document.getElementById('keyboard-diagnostics-status').textContent =
-    `${result.build} / ${result.mode || '未選択'} / ${result.running ? '記録中' : '停止中'} / ${result.summary?.status || '未開始'} / 開始時：${editor.value === '' ? '空文書・待ち受け可能' : '新規作成が必要'}`;
-  // Opening the panel happens only after observation; mark it as contaminated.
-  keyboardDiagnostics.note('diagnostic-panel-opened');
-}
 
 let viewportRefreshTimer = null;
 let viewportRefreshRaf = null;
@@ -4938,22 +4801,20 @@ function keepEditorCaretVisibleAfterResize() {
   }
 }
 
-function updateVisualViewportLayout(source = 'direct') {
-  const diagnostic = (reason) => keyboardDiagnostics.note('layout-update', { source, reason });
+function updateVisualViewportLayout() {
   const viewport = window.visualViewport;
-  if (!viewport) { diagnostic('no-api'); return; }
+  if (!viewport) return;
   // Freeze the last unzoomed app box during pinch zoom. Resizing/repositioning
   // it to the magnified viewport would reflow text and fight normal panning.
-  if (!Number.isFinite(viewport.scale) || Math.abs(viewport.scale - 1) > 0.01) { diagnostic('zoom'); return; }
+  if (!Number.isFinite(viewport.scale) || Math.abs(viewport.scale - 1) > 0.01) return;
   const height = viewport.height;
   const top = Math.max(0, viewport.offsetTop);
   const width = viewport.width;
-  if (![height, top, width].every(Number.isFinite) || height <= 0 || width <= 0) { diagnostic('invalid-bounds'); return; }
+  if (![height, top, width].every(Number.isFinite) || height <= 0 || width <= 0) return;
   const previous = lastVisualViewportBounds;
   const sizeChanged = !previous || Math.abs(height - previous.height) >= 0.5 || Math.abs(width - previous.width) >= 0.5;
   const topChanged = !previous || Math.abs(top - previous.top) >= 0.5;
-  if (!sizeChanged && !topChanged) { diagnostic('unchanged'); return; }
-  diagnostic(sizeChanged ? 'size-changed' : 'top-changed');
+  if (!sizeChanged && !topChanged) return;
 
   const previousEditorHeight = editor.clientHeight;
   document.body.style.setProperty('--app-viewport-height', `${height}px`);
@@ -4982,7 +4843,7 @@ function scheduleVisualViewportLayout() {
   if (visualViewportRaf !== null) return;
   visualViewportRaf = requestAnimationFrame(() => {
     visualViewportRaf = null;
-    updateVisualViewportLayout('raf');
+    updateVisualViewportLayout();
   });
 }
 
@@ -5015,7 +4876,7 @@ function handleVisualViewportChange() {
     }
     // This applies the same scale guard, change detection and scroll sync as
     // the immediate path. It does not start or extend a resampling cycle.
-    updateVisualViewportLayout('resample');
+    updateVisualViewportLayout();
     cycle.index++;
     // Skip missed slots instead of issuing a burst of catch-up reads if the
     // main thread was busy. A suspended page never replays an old cycle.
@@ -5224,7 +5085,6 @@ function normalizePreviewWidth(reason = '') {
 }
 
 function refreshLayoutAfterViewportChange(reason = '') {
-  keyboardDiagnostics.note('layout-refresh', { reason });
   syncIPadSafariFullscreenClass();
   renderFullscreenMenuCheck();
   if (previewOpen) {
@@ -5238,7 +5098,6 @@ function refreshLayoutAfterViewportChange(reason = '') {
 }
 
 function scheduleViewportRefresh(reason = '') {
-  keyboardDiagnostics.note('layout-refresh-scheduled', { reason });
   if (viewportRefreshRaf !== null) cancelAnimationFrame(viewportRefreshRaf);
   viewportRefreshRaf = requestAnimationFrame(() => {
     viewportRefreshRaf = null;
@@ -6069,6 +5928,7 @@ function clearPendingReplaceAllUndoRestore() {
 }
 
 function setEditorDocumentValue(value) {
+  ipadKeyboardTrial.documentChanged();
   clearPendingReplaceAllUndoRestore();
   editor.value = value;
   resetSearchForDocumentSwitch();
@@ -11492,7 +11352,7 @@ function closeDocModal() {
 
 function showQuickStart() { openDocModal(T.quickStart, T.quickStartDoc); }
 function showKeyboardShortcuts() { openDocModal(T.keyboardShortcuts, T.keyboardShortcutsDoc); }
-function showAboutMdworks() { openDocModal(T.aboutMdworks, T.aboutDoc); }
+function showAboutMdworks() { openDocModal(T.aboutMdworks, T.aboutDoc + '\n\n' + ipadKeyboardTrial.description()); }
 
 function openGitHubRepo() {
   closeMenus();
@@ -11937,7 +11797,6 @@ async function newFile() {
   resetDocumentIdentity();
   update();
   markSaved();
-  keyboardDiagnostics.newDocument();
   await triggerAutoSave();
   editor.focus();
   const continuedSessionId = resumeDeepEditForFreshDocumentContext(continueDeepEdit, 'new-file');
